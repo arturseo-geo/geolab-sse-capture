@@ -1,0 +1,13 @@
+# Known seeded-baseline domains/URLs that appear in safe_urls across sessions
+# regardless of prompt content. These are platform-injected, not retrieval results.
+# Extend this list as you observe new entries that appear consistently.
+apple.com
+www.apple.com
+statefarm.com
+www.statefarm.com
+progressive.com
+www.progressive.com
+openai.com
+www.openai.com
+github.com/openclaw/openclaw
+docs.google.com/document/d/

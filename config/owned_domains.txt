@@ -1,0 +1,4 @@
+# Domains you own or control, one per line.
+# The report highlights these in the retrieval pool, safe_urls, and cited set.
+# Use bare domains without protocol (e.g. example.com, not https://example.com).
+example.com

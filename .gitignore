@@ -1,0 +1,31 @@
+# Captured data -- NEVER commit
+captures/
+dumps/
+scrubbed/
+organised/
+*.meta.json
+*.scrubbed.json
+
+# Test captures
+*.txt
+!config/*.txt
+!docs/*.txt
+
+# Local config overrides (user's real domains/locations -- never commit)
+config/*.local.txt
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Node
+node_modules/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Manifest CSV (contains session-specific provenance)
+manifest.csv

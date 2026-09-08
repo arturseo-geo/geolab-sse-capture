@@ -1,0 +1,5 @@
+# Location terms to check for personalisation signals, one per line.
+# If any of these appear in the capture payload, the report flags them
+# as potential location-confound signals that could bias retrieval results.
+# Add your city, region, country, or any place name relevant to your testing.
+Springfield

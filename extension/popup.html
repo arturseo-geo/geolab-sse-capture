@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    body {
+      width: 280px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      font-size: 13px;
+      padding: 12px;
+      margin: 0;
+      color: #222;
+    }
+    h2 {
+      margin: 0 0 10px;
+      font-size: 15px;
+      font-weight: 600;
+    }
+    .status {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: #aaa;
+      flex-shrink: 0;
+    }
+    .dot.recording {
+      background: #e53935;
+      animation: pulse 1.2s infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+    button {
+      display: block;
+      width: 100%;
+      padding: 8px;
+      border: none;
+      border-radius: 4px;
+      background: #1a73e8;
+      color: #fff;
+      font-size: 13px;
+      cursor: pointer;
+      margin-bottom: 10px;
+    }
+    button:hover { background: #1557b0; }
+    button.stop { background: #e53935; }
+    button.stop:hover { background: #c62828; }
+    .info {
+      font-size: 12px;
+      color: #555;
+      margin-bottom: 6px;
+    }
+    .info span { color: #222; font-weight: 500; }
+    input[type="text"] {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 6px 8px;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+      font-size: 12px;
+      margin-top: 4px;
+    }
+    label {
+      font-size: 12px;
+      color: #555;
+    }
+    .warn {
+      font-size: 11px;
+      color: #999;
+      margin-top: 8px;
+    }
+  </style>
+</head>
+<body>
+  <h2>SSE Capture</h2>
+
+  <div class="status">
+    <div class="dot" id="dot"></div>
+    <span id="statusText">Off</span>
+  </div>
+
+  <button id="toggleBtn">Start Capture</button>
+
+  <div class="info">Captures: <span id="captureCount">0</span></div>
+  <div class="info">Last file: <span id="lastFile">—</span></div>
+
+  <label>Label (optional)
+    <input type="text" id="labelInput" placeholder="e.g. E097 query 3">
+  </label>
+
+  <div class="warn" id="warn"></div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
