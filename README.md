@@ -15,7 +15,9 @@ This writes scrubbed copies to `/scrubbed`. Originals are never modified.
 ## What it does
 
 - Captures raw response bodies from ChatGPT `/backend-api/*conversation` endpoints via the Chrome DevTools Protocol (`chrome.debugger`)
-- Saves each capture as a `.txt` (raw body) and `.meta.json` (URL, headers, timing) to your Downloads folder
+- Scrubs tokens and secrets at write time (no unscrubbed bytes reach disk)
+- Saves each capture as a folder with per-round part files, a manifest, metadata, and a schema fingerprint
+- Appends a fingerprint line to `fingerprints.jsonl` for field-presence time-series
 - Post-capture scripts organise, report on, diff, and export the captured data
 - Everything runs locally. No external requests, no telemetry, no analytics, no phone-home
 
@@ -23,7 +25,6 @@ This writes scrubbed copies to `/scrubbed`. Originals are never modified.
 
 - Does not modify, inject into, or interact with the ChatGPT page
 - Does not send captured data anywhere
-- Does not parse or alter raw capture content (processing works on copies)
 - Does not require a build step or external dependencies (extension is plain JS; scripts are Python 3 stdlib)
 
 ## Credit and context
@@ -70,6 +71,53 @@ python scripts/diff.py organised/P07_run1_plus_6aa020fd.json organised/P07_run2_
 python scripts/export_paths.py organised/P07_run1_plus_6aa020fd.json
 python scripts/scrub.py organised/  # before sharing anything
 ```
+
+## Capture folder layout
+
+Each capture produces a folder in `Downloads/sse-capture/`:
+
+```
+2026-09-08T14-52-07-278Z_6aa020fd/
+  manifest.json          # Part list, byte counts, split method
+  part_00_preamble.txt   # System messages, user prompt
+  part_01_search.txt     # Search/tool round (web.run)
+  part_02_answer.txt     # Assistant answer continuation
+  meta.json              # Response headers (scrubbed), timing
+  fingerprint.json       # Schema fingerprint (see below)
+```
+
+SSE streams are split at search/tool round boundaries (detected by `"recipient":"web"` transitions). If no round boundaries are found and the body exceeds 8 MB, it falls back to fixed-size 8 MB chunks (noted as `"split_method":"fixed_8mb"` in the manifest). Buffered (non-SSE) conversation JSON is saved as a single `part_00_complete.json`.
+
+## Schema fingerprint
+
+Each capture folder contains a `fingerprint.json` with:
+
+- `captured_at`: ISO 8601 UTC timestamp
+- `conversation_id`: extracted from the stream (null if not present)
+- `model`: from `model_slug` or `resolved_model_slug` (null if not recoverable)
+- `reasoning_setting`: from the stream if present (null if not; never guessed)
+- `keys_present`: boolean for each of: `should_fetch`, `page_contents`, `snippet::parts`, `snippet::scores`, `result_source`, `fetched_pages`, `search_result_groups`, `web_search_queries`
+- `counts`: SSE event count, search/tool round count, total bytes
+
+A running `fingerprints.jsonl` in the output folder collects one line per capture so field-presence changes can be plotted over time without opening individual dumps.
+
+## Write-time scrub list
+
+All scrubbing happens in the extension's write path. No unscrubbed bytes reach disk. Scrubbed fields are replaced with `[REDACTED:<field>]` markers. The following are scrubbed:
+
+- JWT tokens (three-segment `eyJ...` pattern)
+- Bearer tokens in Authorization headers
+- `conduit_token`, `x-conduit-token` values
+- Cookies and Set-Cookie headers
+- `oai-device-id` and all `oai-*` identifier headers (except `oai-request-id`, which is preserved for record matching)
+- `x-oai-is-update`, `x-oai-is-receipt` opaque tokens
+- `ad_data_token`, `ads_spam_integrity_payload`
+- Email addresses
+- `user_id`, `account_id`, `user_profile_id` values
+
+**Not scrubbed** (needed for record joins): `conversation_id`, message IDs, `x-oai-request-id`.
+
+Unit tests in `extension/tests/test_scrub.html` verify that a synthetic stream with fake secrets produces zero surviving tokens after scrubbing.
 
 ## Report sections
 

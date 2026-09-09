@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>SSE Capture — Scrub Unit Tests</title>
+  <style>
+    body { font-family: monospace; font-size: 13px; padding: 16px; }
+    .pass { color: green; }
+    .fail { color: red; font-weight: bold; }
+    pre { background: #f5f5f5; padding: 8px; overflow-x: auto; }
+  </style>
+</head>
+<body>
+  <h2>Scrub Unit Tests</h2>
+  <div id="results"></div>
+
+  <!--
+    Load background.js in a page context to access globalThis._sseCapture.
+    The chrome.* APIs won't be available, but scrubText/scrubHeaders are
+    pure functions that don't need them.
+  -->
+  <script>
+    // Stub chrome APIs so background.js can load without errors
+    if (typeof chrome === "undefined") window.chrome = {};
+    chrome.action = { setBadgeText: () => {}, setBadgeBackgroundColor: () => {} };
+    chrome.debugger = { onEvent: { addListener: () => {} }, onDetach: { addListener: () => {} } };
+    chrome.tabs = { onRemoved: { addListener: () => {} } };
+    chrome.runtime = { onMessage: { addListener: () => {} }, lastError: null };
+    chrome.downloads = { download: () => {} };
+    chrome.storage = { session: { set: async () => {}, remove: async () => {} } };
+  </script>
+  <script src="../background.js"></script>
+  <script>
+    const { scrubText, scrubHeaders } = globalThis._sseCapture;
+    const results = document.getElementById("results");
+    let passed = 0, failed = 0;
+
+    function assert(name, condition, detail) {
+      const el = document.createElement("div");
+      if (condition) {
+        el.className = "pass";
+        el.textContent = `PASS: ${name}`;
+        passed++;
+      } else {
+        el.className = "fail";
+        el.textContent = `FAIL: ${name}`;
+        if (detail) {
+          const pre = document.createElement("pre");
+          pre.textContent = detail;
+          el.appendChild(pre);
+        }
+        failed++;
+      }
+      results.appendChild(el);
+    }
+
+    // ── Synthetic stream with fake secrets ──
+    const syntheticStream = [
+      'data: {"type":"resume_conversation_token","kind":"topic",',
+      '"token":"eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.eyJjb25kdWl0X3V1aWQiOiJhYmMxMjMifQ.fakeSignatureHere",',
+      '"conversation_id":"6aa020fd-d264-83eb-98d0-95f5411bee35"}',
+      '',
+      'data: {"conduit_token":"eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.eyJ0ZXN0IjoiZGF0YSJ9.anotherFakeSig",',
+      '"status":"IS_STREAMING"}',
+      '',
+      'data: {"type":"delta","v":{"message":{"metadata":{',
+      '"model_slug":"gpt-5-6","user_id":"user-abc123xyz",',
+      '"account_id":"acct-987654"}}},',
+      '"conversation_id":"6aa020fd-d264-83eb-98d0-95f5411bee35"}',
+      '',
+      'data: {"email":"testuser@example.com","oai-device-id":"dev-12345-abcde"}',
+    ].join("\n");
+
+    const syntheticHeaders = {
+      "content-type": "text/event-stream",
+      "x-conduit-token": "eyJhbGciOiJFUzI1NiJ9.eyJ0ZXN0IjoiMSJ9.signatureXYZ",
+      "cookie": "session=abc123; _puid=user-token-value",
+      "set-cookie": "__Secure-next-auth.session-token=secret; path=/",
+      "oai-device-id": "device-uuid-12345",
+      "x-oai-is-update": "ois1.eyJhbGciOiJFUzI1NiJ9.eyJ0ZXN0IjoiMiJ9.updateSig",
+      "x-oai-is-receipt": "ois1.eyJhbGciOiJFUzI1NiJ9.eyJ0ZXN0IjoiMyJ9.receiptSig",
+      "x-oai-request-id": "req-12345-should-survive",
+      "authorization": "Bearer sk-fake-api-key-1234567890",
+      "x-build": "5bc70726e96d",
+    };
+
+    // ── Run scrubText tests ──
+    const scrubbed = scrubText(syntheticStream);
+
+    assert("JWTs removed from body",
+      !scrubbed.includes("eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9"),
+      `Found JWT in: ${scrubbed.slice(0, 500)}`
+    );
+
+    assert("conduit_token value scrubbed",
+      scrubbed.includes("[REDACTED:") && !scrubbed.includes("eyJjb25kdWl0"),
+      scrubbed
+    );
+
+    assert("email scrubbed",
+      !scrubbed.includes("testuser@example.com") && scrubbed.includes("[REDACTED:email]"),
+      scrubbed
+    );
+
+    assert("user_id scrubbed",
+      !scrubbed.includes("user-abc123xyz") && scrubbed.includes("[REDACTED:id]"),
+      scrubbed
+    );
+
+    assert("account_id scrubbed",
+      !scrubbed.includes("acct-987654") && scrubbed.includes("[REDACTED:id]"),
+      scrubbed
+    );
+
+    assert("conversation_id preserved",
+      scrubbed.includes("6aa020fd-d264-83eb-98d0-95f5411bee35"),
+      scrubbed
+    );
+
+    assert("oai-device-id value scrubbed in body",
+      !scrubbed.includes("dev-12345-abcde"),
+      scrubbed
+    );
+
+    // ── Run scrubHeaders tests ──
+    const scrubbedH = scrubHeaders(syntheticHeaders);
+
+    assert("x-conduit-token header scrubbed",
+      scrubbedH["x-conduit-token"].includes("[REDACTED:"),
+      JSON.stringify(scrubbedH, null, 2)
+    );
+
+    assert("cookie header scrubbed",
+      scrubbedH["cookie"].includes("[REDACTED:"),
+      JSON.stringify(scrubbedH, null, 2)
+    );
+
+    assert("set-cookie header scrubbed",
+      scrubbedH["set-cookie"].includes("[REDACTED:"),
+      JSON.stringify(scrubbedH, null, 2)
+    );
+
+    assert("oai-device-id header scrubbed",
+      scrubbedH["oai-device-id"].includes("[REDACTED:"),
+      JSON.stringify(scrubbedH, null, 2)
+    );
+
+    assert("x-oai-is-update header scrubbed",
+      scrubbedH["x-oai-is-update"].includes("[REDACTED:"),
+      JSON.stringify(scrubbedH, null, 2)
+    );
+
+    assert("x-oai-is-receipt header scrubbed",
+      scrubbedH["x-oai-is-receipt"].includes("[REDACTED:"),
+      JSON.stringify(scrubbedH, null, 2)
+    );
+
+    assert("authorization header scrubbed",
+      scrubbedH["authorization"].includes("[REDACTED:"),
+      JSON.stringify(scrubbedH, null, 2)
+    );
+
+    assert("x-oai-request-id preserved",
+      scrubbedH["x-oai-request-id"] === "req-12345-should-survive",
+      JSON.stringify(scrubbedH, null, 2)
+    );
+
+    assert("x-build preserved",
+      scrubbedH["x-build"] === "5bc70726e96d",
+      JSON.stringify(scrubbedH, null, 2)
+    );
+
+    assert("content-type preserved",
+      scrubbedH["content-type"] === "text/event-stream",
+      JSON.stringify(scrubbedH, null, 2)
+    );
+
+    // ── Final no-secrets sweep ──
+    // Grep the scrubbed body for any surviving JWT-shaped strings
+    const jwtSurvivors = scrubbed.match(/eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g);
+    assert("No JWT survivors in scrubbed body",
+      !jwtSurvivors || jwtSurvivors.length === 0,
+      jwtSurvivors ? `Survivors: ${jwtSurvivors.join(", ")}` : ""
+    );
+
+    // Check headers for JWT survivors
+    const headerStr = JSON.stringify(scrubbedH);
+    const headerJwts = headerStr.match(/eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g);
+    assert("No JWT survivors in scrubbed headers",
+      !headerJwts || headerJwts.length === 0,
+      headerJwts ? `Survivors: ${headerJwts.join(", ")}` : ""
+    );
+
+    // ── Summary ──
+    const summary = document.createElement("h3");
+    summary.textContent = `${passed} passed, ${failed} failed`;
+    summary.className = failed > 0 ? "fail" : "pass";
+    results.insertBefore(summary, results.firstChild);
+  </script>
+</body>
+</html>

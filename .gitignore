@@ -5,6 +5,8 @@ scrubbed/
 organised/
 *.meta.json
 *.scrubbed.json
+*.fingerprint.json
+fingerprints.jsonl
 
 # Test captures
 *.txt
