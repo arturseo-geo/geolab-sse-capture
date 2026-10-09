@@ -35,15 +35,18 @@ def classify_file(path):
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         head = f.read(200)
 
-    # SSE stream files start with "event:"
-    if head.strip().startswith("event:"):
+    # SSE stream files start with "event:" or "data:"
+    if head.strip().startswith("event:") or head.strip().startswith("data:"):
         # Try to extract conversation_id from the stream
         conv_id = None
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
-                if '"conversation_id"' in line and line.startswith("data:"):
+                if '"conversation_id"' in line:
+                    data_line = line
+                    if line.startswith("data:"):
+                        data_line = line[5:]
                     try:
-                        d = json.loads(line[5:].strip())
+                        d = json.loads(data_line.strip())
                         conv_id = d.get("conversation_id")
                         if conv_id:
                             break
@@ -65,6 +68,14 @@ def classify_file(path):
             data = json.load(f)
     except (json.JSONDecodeError, ValueError):
         return ("json_error", None, 0, size)
+
+    # Error/request sidecar files (v1.2.0)
+    if "error" in data and ("url" in data or "warning" in data):
+        return ("error_sidecar", data.get("conversation_id"), 0, size)
+
+    if "action" in data and "messages" in data:
+        cid = data.get("conversation_id")
+        return ("request_body", cid, 0, size)
 
     # Stubs: conduit_token + status
     if set(data.keys()) <= {"conduit_token", "status"}:

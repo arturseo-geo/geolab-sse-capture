@@ -9,11 +9,23 @@ const dot = document.getElementById("dot");
 const statusText = document.getElementById("statusText");
 const toggleBtn = document.getElementById("toggleBtn");
 const captureCount = document.getElementById("captureCount");
+const streamCount = document.getElementById("streamCount");
+const lastStreamTime = document.getElementById("lastStreamTime");
 const lastFile = document.getElementById("lastFile");
 const labelInput = document.getElementById("labelInput");
 const warn = document.getElementById("warn");
 
 let currentTabId = null;
+
+function formatTime(iso) {
+  if (!iso) return "--";
+  try {
+    const d = new Date(iso);
+    return d.toLocaleTimeString();
+  } catch (_) {
+    return iso;
+  }
+}
 
 function updateUI(state) {
   if (state.attached) {
@@ -28,7 +40,9 @@ function updateUI(state) {
     toggleBtn.classList.remove("stop");
   }
   captureCount.textContent = state.captures || 0;
-  lastFile.textContent = state.lastFile || "—";
+  streamCount.textContent = state.streamCaptures || 0;
+  lastStreamTime.textContent = formatTime(state.lastStreamTime);
+  lastFile.textContent = state.lastFile || "--";
   labelInput.value = state.label || "";
 }
 
@@ -37,7 +51,6 @@ async function init() {
   if (!tab) return;
   currentTabId = tab.id;
 
-  // Check if the tab is on chatgpt.com
   if (!tab.url || !tab.url.includes("chatgpt.com")) {
     toggleBtn.disabled = true;
     toggleBtn.textContent = "Not on chatgpt.com";

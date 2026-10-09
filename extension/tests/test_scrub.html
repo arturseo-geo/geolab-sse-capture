@@ -11,7 +11,7 @@
   </style>
 </head>
 <body>
-  <h2>Scrub Unit Tests</h2>
+  <h2>Scrub Unit Tests (v1.2.0)</h2>
   <div id="results"></div>
 
   <!--
@@ -84,7 +84,7 @@
       "x-build": "5bc70726e96d",
     };
 
-    // ── Run scrubText tests ──
+    // ── Run scrubText tests on stream body ──
     const scrubbed = scrubText(syntheticStream);
 
     assert("JWTs removed from body",
@@ -175,20 +175,114 @@
       JSON.stringify(scrubbedH, null, 2)
     );
 
+    // ── REQUEST BODY SCRUBBING (v1.2.0) ──
+    // Synthetic POST request body for /backend-api/f/conversation
+    const syntheticRequest = JSON.stringify({
+      action: "next",
+      messages: [{
+        id: "aaa235b7-e1e0-4e14-8a0c-b2f48e46b4a1",
+        author: { role: "user" },
+        content: {
+          content_type: "text",
+          parts: ["Search for site:en.wikipedia.org Cambourne and list every URL"]
+        },
+        metadata: { serialization_metadata: { custom_symbol_offsets: [] } }
+      }],
+      conversation_id: "6ac8aaf2-e094-83eb-ad77-8ac2ee43a28b",
+      parent_message_id: "aaa13580-9999-4444-aaaa-111111111111",
+      model: "gpt-6",
+      timezone_offset_min: -60,
+      timezone: "Europe/London",
+      suggestions: [],
+      history_and_training_disabled: true,
+      conversation_mode: { kind: "primary_assistant" },
+      websocket_request_id: "bb7c3a55-2222-3333-4444-555566667777",
+      system_hints: [],
+      supported_encodings: ["br"],
+      supports_buffering: true,
+      thinking_effort: "medium",
+      authorization: "Bearer eyJhbGciOiJSUzI1NiJ9.eyJ1c2VyIjoiYWJjMTIzIn0.longFakeSignatureHere",
+      user_id: "user-SENSITIVE_ID_12345",
+      account_id: "acct-SENSITIVE_ACCT_999",
+      ad_data_token: "eyJhbGciOiJFUzI1NiJ9.eyJhZCI6InRlc3QifQ.adTokenSig",
+      email_in_payload: "researcher@university.ac.uk",
+    });
+
+    const scrubbedReq = scrubText(syntheticRequest);
+
+    assert("Request: prompt text preserved",
+      scrubbedReq.includes("Search for site:en.wikipedia.org Cambourne"),
+      scrubbedReq.slice(0, 500)
+    );
+
+    assert("Request: model field preserved",
+      scrubbedReq.includes('"gpt-6"'),
+      scrubbedReq
+    );
+
+    assert("Request: thinking_effort preserved",
+      scrubbedReq.includes('"medium"'),
+      scrubbedReq
+    );
+
+    assert("Request: conversation_id preserved",
+      scrubbedReq.includes("6ac8aaf2-e094-83eb-ad77-8ac2ee43a28b"),
+      scrubbedReq
+    );
+
+    assert("Request: Bearer token scrubbed",
+      !scrubbedReq.includes("eyJhbGciOiJSUzI1NiJ9") && scrubbedReq.includes("[REDACTED:"),
+      scrubbedReq
+    );
+
+    assert("Request: user_id scrubbed",
+      !scrubbedReq.includes("SENSITIVE_ID_12345"),
+      scrubbedReq
+    );
+
+    assert("Request: account_id scrubbed",
+      !scrubbedReq.includes("SENSITIVE_ACCT_999"),
+      scrubbedReq
+    );
+
+    assert("Request: ad_data_token scrubbed",
+      !scrubbedReq.includes("adTokenSig"),
+      scrubbedReq
+    );
+
+    assert("Request: email in payload scrubbed",
+      !scrubbedReq.includes("researcher@university.ac.uk"),
+      scrubbedReq
+    );
+
+    assert("Request: history_and_training_disabled preserved",
+      scrubbedReq.includes("history_and_training_disabled"),
+      scrubbedReq
+    );
+
     // ── Final no-secrets sweep ──
-    // Grep the scrubbed body for any surviving JWT-shaped strings
     const jwtSurvivors = scrubbed.match(/eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g);
     assert("No JWT survivors in scrubbed body",
       !jwtSurvivors || jwtSurvivors.length === 0,
       jwtSurvivors ? `Survivors: ${jwtSurvivors.join(", ")}` : ""
     );
 
-    // Check headers for JWT survivors
     const headerStr = JSON.stringify(scrubbedH);
     const headerJwts = headerStr.match(/eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g);
     assert("No JWT survivors in scrubbed headers",
       !headerJwts || headerJwts.length === 0,
       headerJwts ? `Survivors: ${headerJwts.join(", ")}` : ""
+    );
+
+    const reqJwts = scrubbedReq.match(/eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g);
+    assert("No JWT survivors in scrubbed request body",
+      !reqJwts || reqJwts.length === 0,
+      reqJwts ? `Survivors: ${reqJwts.join(", ")}` : ""
+    );
+
+    assert("No Bearer token survivors in scrubbed request body",
+      !scrubbedReq.match(/Bearer\s+[A-Za-z0-9_.\-\/+=]{20,}/i),
+      scrubbedReq
     );
 
     // ── Summary ──

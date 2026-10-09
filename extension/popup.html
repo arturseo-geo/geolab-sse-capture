@@ -79,7 +79,7 @@
   </style>
 </head>
 <body>
-  <h2>SSE Capture</h2>
+  <h2>SSE Capture <span style="font-size:11px;color:#888">v1.2.0</span></h2>
 
   <div class="status">
     <div class="dot" id="dot"></div>
@@ -88,8 +88,10 @@
 
   <button id="toggleBtn">Start Capture</button>
 
-  <div class="info">Captures: <span id="captureCount">0</span></div>
-  <div class="info">Last file: <span id="lastFile">—</span></div>
+  <div class="info">Total captures: <span id="captureCount">0</span></div>
+  <div class="info">Stream captures: <span id="streamCount">0</span></div>
+  <div class="info">Last stream: <span id="lastStreamTime">--</span></div>
+  <div class="info">Last file: <span id="lastFile">--</span></div>
 
   <label>Label (optional)
     <input type="text" id="labelInput" placeholder="e.g. E097 query 3">

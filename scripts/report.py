@@ -521,6 +521,16 @@ def generate_report(capture_path, config_dir=None):
 
     all_lines.extend(section_fanout_queries(data))
 
+    # Missing-stream check (v1.2.0)
+    if pool and total_pool_entries > 0:
+        sse_path = Path(capture_path).with_suffix(".sse.txt")
+        if not sse_path.exists():
+            all_lines.append("")
+            all_lines.append("WARNING: MISSING STREAM")
+            all_lines.append("=" * 60)
+            all_lines.append("  This conversation has search results but no .sse.txt stream file.")
+            all_lines.append("  The answer stream may not have been captured.")
+
     # Footer
     all_lines.append("")
     all_lines.append("-" * 60)

@@ -6,29 +6,45 @@
 // See the NOTICE file distributed with this work for attribution.
 
 /**
- * SSE Capture — background service worker.
+ * SSE Capture v1.2.0 — background service worker.
  *
  * Uses chrome.debugger (Chrome DevTools Protocol) to intercept network
  * responses from chatgpt.com conversation endpoints. Captures raw SSE
  * stream bodies and saves them to disk via chrome.downloads.
  *
+ * v1.2.0 changes:
+ * - Stream capture via Network.dataReceived (fetch-based SSE). ChatGPT
+ *   streams via fetch(), not EventSource. Network.getResponseBody fails
+ *   on these. We accumulate base64 chunks from dataReceived in real time.
+ * - Request capture via Network.requestWillBeSent: correct method, URL,
+ *   and POST body (scrubbed). Saved as request.json in capture folder.
+ * - Error reporting: capture failures write error.json and set badge ERR.
+ * - Fingerprint additions: method, turn_use_case, thinking_effort,
+ *   is_temporary_chat, all model_slug values, has_stream.
+ * - Missing-stream guard: GET conversation with search results but no
+ *   stream capture -> warning in error.json.
+ *
  * Debugger protocol docs:
  *   https://chromedevtools.github.io/devtools-protocol/tot/Network/
  *
  * Key events used:
- *   Network.responseReceived    — fires when headers arrive; we note the URL
- *   Network.loadingFinished     — fires when the body is complete; we fetch it
- *   Network.eventSourceMessageReceived — fires per SSE event; we concatenate
+ *   Network.requestWillBeSent      — method, URL, POST body
+ *   Network.responseReceived       — response headers, content-type
+ *   Network.dataReceived           — streamed body chunks (base64)
+ *   Network.loadingFinished        — body complete; assemble and save
+ *   Network.eventSourceMessageReceived — secondary path (legacy)
  */
 
 // ── State ─────────────────────────────────────────────────────────────────
 
-// Per-tab capture state: tabId -> { attached, captures, lastFile, label,
-//   pendingRequests: { requestId -> { url, method, startTime, headers, sseChunks[] } } }
+// Per-tab capture state
 const tabs = new Map();
 
 // URL pattern: matches /backend-api/…conversation… endpoints
 const CONV_PATTERN = /\/backend-api\/.*conversation/;
+
+// Stream URL: the POST that carries the answer stream
+const STREAM_URL_PATTERN = /\/backend-api\/f\/conversation$/;
 
 // ── Badge helpers ─────────────────────────────────────────────────────────
 
@@ -40,6 +56,11 @@ function setBadge(tabId, recording) {
   });
 }
 
+function setErrorBadge(tabId) {
+  chrome.action.setBadgeText({ text: "ERR", tabId });
+  chrome.action.setBadgeBackgroundColor({ color: "#ff6f00", tabId });
+}
+
 // ── Tab state helpers ─────────────────────────────────────────────────────
 
 function getTab(tabId) {
@@ -47,9 +68,12 @@ function getTab(tabId) {
     tabs.set(tabId, {
       attached: false,
       captures: 0,
+      streamCaptures: 0,
       lastFile: null,
+      lastStreamTime: null,
       label: "",
       pendingRequests: {},
+      recentStreamConvIds: [], // [{convId, time}] for missing-stream guard
     });
   }
   return tabs.get(tabId);
@@ -57,14 +81,6 @@ function getTab(tabId) {
 
 // ── Attach / detach debugger ──────────────────────────────────────────────
 
-/**
- * Attach chrome.debugger to a tab and enable the Network domain.
- *
- * chrome.debugger.attach(target, protocolVersion) connects to the tab's
- * DevTools backend. Once attached, we send Network.enable to start
- * receiving network events. The user sees a yellow "started debugging"
- * banner — this is expected and cannot be suppressed.
- */
 async function attachToTab(tabId) {
   const state = getTab(tabId);
   if (state.attached) return;
@@ -76,11 +92,9 @@ async function attachToTab(tabId) {
     return;
   }
 
-  // Enable the Network domain so we receive response/loading/SSE events.
-  // maxTotalBufferSize ensures large SSE streams aren't truncated.
   try {
     await chrome.debugger.sendCommand({ tabId }, "Network.enable", {
-      maxTotalBufferSize: 100 * 1024 * 1024, // 100 MB
+      maxTotalBufferSize: 100 * 1024 * 1024,
     });
   } catch (err) {
     console.error("[sse-capture] Network.enable failed: %s", err.message);
@@ -93,9 +107,6 @@ async function attachToTab(tabId) {
   console.log("[sse-capture] attached to tab %d", tabId);
 }
 
-/**
- * Detach chrome.debugger from a tab. Cleans up state.
- */
 async function detachFromTab(tabId) {
   const state = getTab(tabId);
   if (!state.attached) return;
@@ -103,7 +114,6 @@ async function detachFromTab(tabId) {
   try {
     await chrome.debugger.detach({ tabId });
   } catch (err) {
-    // Tab may already be closed; ignore
     console.warn("[sse-capture] detach warning for tab %d: %s", tabId, err.message);
   }
 
@@ -112,8 +122,6 @@ async function detachFromTab(tabId) {
   setBadge(tabId, false);
   console.log("[sse-capture] detached from tab %d", tabId);
 }
-
-// ── Toggle (called from popup) ────────────────────────────────────────────
 
 async function toggleCapture(tabId) {
   const state = getTab(tabId);
@@ -126,77 +134,50 @@ async function toggleCapture(tabId) {
 }
 
 // ── Token scrubbing ──────────────────────────────────────────────────────
-//
-// All scrubbing runs in the write path BEFORE bytes reach disk.
-// We scrub: JWTs, bearer tokens, conduit_token values, cookies,
-// oai-* identifier headers, user/account IDs, emails, ad tokens.
-// We preserve conversation_id and message IDs (needed for record joins).
 
 /** JWT pattern: three base64url segments separated by dots, first starts eyJ */
 const JWT_RE = /eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g;
 
-/**
- * Scrub sensitive tokens from a text string (SSE stream or serialised JSON).
- * Returns the scrubbed string.  Exported for testing via globalThis._sseCapture.
- */
 function scrubText(text) {
-  // 1. JWTs (covers conduit_token values, x-conduit-token, bearer payloads,
-  //    oai-is-update/receipt opaque tokens, ad_data_token base64 payloads)
+  // 1. JWTs
   text = text.replace(JWT_RE, "[REDACTED:jwt]");
 
-  // 2. Bearer tokens (in case the token isn't JWT-shaped)
+  // 2. Bearer tokens
   text = text.replace(/Bearer\s+[A-Za-z0-9_.\-\/+=]{20,}/gi, "Bearer [REDACTED:bearer]");
 
-  // 3. JSON string values for known sensitive keys.
-  //    Pattern: "key":"<value>" or "key": "<value>"  (handles optional space)
+  // 3. Sensitive JSON keys
   const sensitiveKeys = [
-    "conduit_token",
-    "authorization",
-    "cookie",
-    "set-cookie",
-    "x-csrf-token",
-    "x-conduit-token",
-    "oai-device-id",
-    "oai-dm-tgt-token",
-    "oai-echo-session-id",
-    "ad_data_token",
-    "ads_spam_integrity_payload",
-    "x-oai-is-update",
-    "x-oai-is-receipt",
+    "conduit_token", "authorization", "cookie", "set-cookie",
+    "x-csrf-token", "x-conduit-token", "oai-device-id",
+    "oai-dm-tgt-token", "oai-echo-session-id", "ad_data_token",
+    "ads_spam_integrity_payload", "x-oai-is-update", "x-oai-is-receipt",
     "x-oai-is-pending-updates-ack",
   ];
   for (const key of sensitiveKeys) {
-    // Match "key":"value" or "key": "value" — value is everything up to
-    // the next unescaped double-quote
     const re = new RegExp(
-      `("${key}"\\s*:\\s*)"(?:[^"\\\\]|\\\\.)*"`,
-      "gi"
+      `("${key}"\\s*:\\s*)"(?:[^"\\\\]|\\\\.)*"`, "gi"
     );
     text = text.replace(re, `$1"[REDACTED:${key}]"`);
   }
 
-  // 4. oai-* headers we might not have listed above (catch-all for response
-  //    headers that carry session identifiers)
+  // 4. oai-* headers catch-all
   text = text.replace(
     /("oai-[a-z0-9_-]+"\s*:\s*)"(?:[^"\\]|\\.)*"/gi,
     (match, prefix) => {
-      // Don't re-scrub if already redacted, and preserve oai-request-id
-      if (match.includes("[REDACTED:") || /oai-request-id/i.test(match)) {
-        return match;
-      }
+      if (match.includes("[REDACTED:") || /oai-request-id/i.test(match)) return match;
       const keyMatch = match.match(/"(oai-[a-z0-9_-]+)"/i);
       const keyName = keyMatch ? keyMatch[1] : "oai-header";
       return `${prefix}"[REDACTED:${keyName}]"`;
     }
   );
 
-  // 5. Email addresses (user@domain.tld pattern)
+  // 5. Email addresses
   text = text.replace(
     /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g,
     "[REDACTED:email]"
   );
 
-  // 6. user_id / account_id string values
+  // 6. user_id / account_id
   text = text.replace(
     /("(?:user_id|account_id|user_profile_id)"\s*:\s*)"(?:[^"\\]|\\.)*"/gi,
     '$1"[REDACTED:id]"'
@@ -205,10 +186,6 @@ function scrubText(text) {
   return text;
 }
 
-/**
- * Scrub a headers object (from Network.responseReceived).
- * Returns a new object with sensitive header values replaced.
- */
 function scrubHeaders(headers) {
   if (!headers || typeof headers !== "object") return headers;
   const scrubbed = {};
@@ -223,47 +200,38 @@ function scrubHeaders(headers) {
     if (sensitiveHeaderPrefixes.some(p => keyLower.startsWith(p))) {
       scrubbed[key] = `[REDACTED:${keyLower}]`;
     } else if (typeof value === "string" && JWT_RE.test(value)) {
-      // Reset regex lastIndex since it has the global flag
       JWT_RE.lastIndex = 0;
       scrubbed[key] = value.replace(JWT_RE, "[REDACTED:jwt]");
     } else {
       scrubbed[key] = value;
     }
-    // Reset global regex state
     JWT_RE.lastIndex = 0;
   }
   return scrubbed;
 }
 
-// Expose scrub functions for testing
+// Expose for testing
 globalThis._sseCapture = { scrubText, scrubHeaders };
 
 // ── Schema fingerprint ───────────────────────────────────────────────────
-//
-// Per-capture sidecar (.fingerprint.json) recording field presence, model,
-// event counts. Also appends to a running fingerprints.jsonl for time-series.
 
-/** Keys whose presence/absence we track in every capture */
 const FINGERPRINT_KEYS = [
-  "should_fetch",
-  "page_contents",
-  "snippet::parts",
-  "snippet::scores",
-  "result_source",
-  "fetched_pages",
-  "search_result_groups",
+  "should_fetch", "page_contents", "snippet::parts", "snippet::scores",
+  "result_source", "fetched_pages", "search_result_groups",
   "web_search_queries",
 ];
 
-/**
- * Build a fingerprint object from the (already-scrubbed) body text.
- */
-function buildFingerprint(body, capturedAt) {
+function buildFingerprint(body, capturedAt, info) {
   const fp = {
     captured_at: capturedAt,
     conversation_id: null,
-    model: null,
+    method: info.method || null,
+    has_stream: false,
+    model_slugs: [],
     reasoning_setting: null,
+    turn_use_case: [],
+    thinking_effort: null,
+    is_temporary_chat: null,
     keys_present: {},
     counts: {
       sse_events: 0,
@@ -272,59 +240,63 @@ function buildFingerprint(body, capturedAt) {
     },
   };
 
-  // conversation_id: first occurrence in the stream
+  // conversation_id
   const cidMatch = body.match(/"conversation_id"\s*:\s*"([^"]+)"/);
   if (cidMatch) fp.conversation_id = cidMatch[1];
 
-  // model_slug: from resolved_model_slug or model_slug
-  const modelMatch = body.match(/"(?:resolved_)?model_slug"\s*:\s*"([^"]+)"/);
-  if (modelMatch) fp.model = modelMatch[1];
+  // has_stream: true if this body looks like an SSE stream
+  fp.has_stream = /^data: /m.test(body);
 
-  // reasoning_setting: only if explicitly present, never guess
+  // model_slug: ALL distinct values (not just first)
+  const modelSlugMatches = body.matchAll(/"model_slug"\s*:\s*"([^"]+)"/g);
+  const slugs = new Set();
+  for (const m of modelSlugMatches) slugs.add(m[1]);
+  const resolvedMatches = body.matchAll(/"resolved_model_slug"\s*:\s*"([^"]+)"/g);
+  for (const m of resolvedMatches) slugs.add(m[1]);
+  fp.model_slugs = [...slugs].sort();
+
+  // reasoning_setting
   const reasoningMatch = body.match(/"reasoning_setting"\s*:\s*"([^"]+)"/);
   if (reasoningMatch) fp.reasoning_setting = reasoningMatch[1];
 
-  // keys_present: string search for each fingerprint key
+  // turn_use_case: all distinct values
+  const tucMatches = body.matchAll(/"turn_use_case"\s*:\s*"([^"]+)"/g);
+  const tucs = new Set();
+  for (const m of tucMatches) tucs.add(m[1]);
+  fp.turn_use_case = [...tucs].sort();
+
+  // thinking_effort: first occurrence
+  const effortMatch = body.match(/"thinking_effort"\s*:\s*"([^"]+)"/);
+  if (effortMatch) fp.thinking_effort = effortMatch[1];
+
+  // is_temporary_chat: from the body (may appear in conversation JSON)
+  const tempMatch = body.match(/"is_temporary_chat"\s*:\s*(true|false)/);
+  if (tempMatch) fp.is_temporary_chat = tempMatch[1] === "true";
+
+  // keys_present
   for (const key of FINGERPRINT_KEYS) {
-    // Use a literal string search (some keys contain :: which isn't a JSON
-    // path, it's the actual key name in OpenAI's schema)
     fp.keys_present[key] = body.includes(`"${key}"`);
   }
 
-  // SSE event count: each "data: " line at the start of a line
+  // SSE event count
   const eventMatches = body.match(/^data: /gm);
   fp.counts.sse_events = eventMatches ? eventMatches.length : 0;
 
-  // Search/tool rounds: count messages with recipient "web" or "web.run"
-  // Each "recipient":"web" or "recipient":"web.run" indicates a search round
+  // Search rounds
   const searchRounds = body.match(/"recipient"\s*:\s*"web(?:\.run)?"/g);
   fp.counts.search_rounds = searchRounds ? searchRounds.length : 0;
+
+  // Backward-compat: keep "model" as first slug or null
+  fp.model = fp.model_slugs[0] || null;
 
   return fp;
 }
 
 // ── Chunked save helpers ─────────────────────────────────────────────────
-//
-// Split SSE streams into per-round files within a capture folder.
-// Round boundaries: a "recipient":"web" message starts a search round,
-// and a subsequent "recipient":"all" or "recipient":"assistant" message
-// after the tool response ends it. If no rounds detected, fall back to
-// 8 MB fixed-size chunks.
 
-const CHUNK_SIZE_LIMIT = 8 * 1024 * 1024; // 8 MB fallback
+const CHUNK_SIZE_LIMIT = 8 * 1024 * 1024;
 
-/**
- * Split an SSE body into logical parts at search/tool round boundaries.
- * Returns an array of { name, content, type } objects.
- *
- * Heuristic: each SSE frame starts with "data: " on its own line.
- * We accumulate frames. When we see a frame whose JSON contains
- * "recipient":"web" (a tool call to the search system), we mark a
- * boundary. The preceding frames form one part, and the search frames
- * form another. The final assistant continuation forms the last part.
- */
 function splitIntoRounds(body) {
-  // Split into individual SSE frames (separated by blank lines)
   const frames = body.split(/\n\n/);
   if (frames.length < 2) {
     return [{ name: "part_00_complete.txt", content: body, type: "complete" }];
@@ -332,20 +304,16 @@ function splitIntoRounds(body) {
 
   const parts = [];
   let currentFrames = [];
-  let currentType = "preamble";
   let partIndex = 0;
   let inSearchRound = false;
 
   for (const frame of frames) {
     if (!frame.trim()) continue;
 
-    // Detect search/tool round start: recipient is "web" or "web.run"
     const isSearchFrame = /"recipient"\s*:\s*"web(?:\.run)?"/.test(frame);
-    // Detect return to main assistant: recipient is "all" after a search round
     const isAllFrame = /"recipient"\s*:\s*"all"/.test(frame);
 
     if (isSearchFrame && !inSearchRound) {
-      // Flush accumulated frames as previous part
       if (currentFrames.length > 0) {
         const suffix = partIndex === 0 ? "preamble" : "answer";
         parts.push({
@@ -357,9 +325,7 @@ function splitIntoRounds(body) {
         currentFrames = [];
       }
       inSearchRound = true;
-      currentType = "search";
     } else if (isAllFrame && inSearchRound) {
-      // Flush search round frames
       if (currentFrames.length > 0) {
         parts.push({
           name: `part_${String(partIndex).padStart(2, "0")}_search.txt`,
@@ -370,13 +336,11 @@ function splitIntoRounds(body) {
         currentFrames = [];
       }
       inSearchRound = false;
-      currentType = "answer";
     }
 
     currentFrames.push(frame);
   }
 
-  // Flush remaining frames
   if (currentFrames.length > 0) {
     const suffix = inSearchRound ? "search" : (parts.length === 0 ? "complete" : "answer");
     parts.push({
@@ -386,8 +350,6 @@ function splitIntoRounds(body) {
     });
   }
 
-  // If we only found one part with no search rounds, check if it needs
-  // fixed-size chunking (body > 8 MB)
   if (parts.length <= 1 && body.length > CHUNK_SIZE_LIMIT) {
     return splitFixedSize(body);
   }
@@ -395,10 +357,6 @@ function splitIntoRounds(body) {
   return parts;
 }
 
-/**
- * Fallback: split body into fixed-size 8 MB chunks.
- * Splits at newline boundaries to avoid cutting mid-frame.
- */
 function splitFixedSize(body) {
   const parts = [];
   let offset = 0;
@@ -406,12 +364,9 @@ function splitFixedSize(body) {
 
   while (offset < body.length) {
     let end = Math.min(offset + CHUNK_SIZE_LIMIT, body.length);
-    // Find the last newline before the limit
     if (end < body.length) {
       const lastNewline = body.lastIndexOf("\n", end);
-      if (lastNewline > offset) {
-        end = lastNewline + 1;
-      }
+      if (lastNewline > offset) end = lastNewline + 1;
     }
     parts.push({
       name: `part_${String(partIndex).padStart(2, "0")}_chunk.txt`,
@@ -426,22 +381,11 @@ function splitFixedSize(body) {
 }
 
 
-// ── Save capture to disk ──────────────────────────────────────────────────
+// ── Save helpers ─────────────────────────────────────────────────────────
 
-/**
- * Encode a string as a base64 data: URL.
- * Uses encodeURIComponent + unescape to handle UTF-8 correctly
- * before btoa (which only accepts Latin-1 / binary-safe input).
- *
- * For strings exceeding ~1.5 MB, we chunk the btoa encoding to avoid
- * call-stack limits in the service worker.
- */
 function toDataUrl(str, mime) {
-  // Convert UTF-8 string to binary-safe Latin-1 for btoa
   const binary = unescape(encodeURIComponent(str));
-
-  // Chunk btoa to avoid stack overflow on large strings
-  const CHUNK = 1024 * 768; // ~768 KB chunks
+  const CHUNK = 1024 * 768;
   let b64 = "";
   for (let i = 0; i < binary.length; i += CHUNK) {
     b64 += btoa(binary.slice(i, i + CHUNK));
@@ -449,10 +393,6 @@ function toDataUrl(str, mime) {
   return `data:${mime};base64,${b64}`;
 }
 
-/**
- * Download a string as a file via chrome.downloads.
- * Returns a promise that resolves with the download ID.
- */
 function downloadFile(content, filename, mime) {
   return new Promise((resolve) => {
     chrome.downloads.download(
@@ -473,35 +413,49 @@ function downloadFile(content, filename, mime) {
   });
 }
 
+// ── Error recording ──────────────────────────────────────────────────────
+
+function saveError(tabId, errorObj) {
+  const state = getTab(tabId);
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const filename = `sse-capture/error_${stamp}.json`;
+  downloadFile(JSON.stringify(errorObj, null, 2), filename, "application/json");
+  setErrorBadge(tabId);
+  console.error("[sse-capture] error recorded: %s", errorObj.error || errorObj.warning);
+}
+
+// ── Save capture to disk ─────────────────────────────────────────────────
+
 function saveCapture(tabId, requestId, info) {
   const state = getTab(tabId);
   const now = new Date();
   const capturedAt = now.toISOString();
   const stamp = capturedAt.replace(/[:.]/g, "-");
 
-  // ── Step 1: Scrub the body and headers before any bytes reach disk ──
+  // Scrub body and headers before any bytes reach disk
   const scrubbedBody = scrubText(info.body);
   const scrubbedHeaders = scrubHeaders(info.headers);
 
-  // ── Step 2: Build fingerprint from the scrubbed body ──
-  const fingerprint = buildFingerprint(scrubbedBody, capturedAt);
+  // Build fingerprint
+  const fingerprint = buildFingerprint(scrubbedBody, capturedAt, info);
 
-  // ── Step 3: Determine folder name and split into parts ──
+  // Folder name
   const convIdShort = fingerprint.conversation_id
     ? fingerprint.conversation_id.slice(0, 8)
     : requestId;
   const folderName = `${stamp}_${convIdShort}`;
   const folderPath = `sse-capture/${folderName}`;
 
-  // Split SSE streams into per-round parts; buffered JSON stays as one file
+  // Split SSE streams; buffered JSON stays as one file
   const isSSE = info.captureMethod === "eventSourceMessages" ||
+                info.captureMethod === "dataReceived" ||
                 scrubbedBody.trimStart().startsWith("event:") ||
                 scrubbedBody.trimStart().startsWith("data:");
   const parts = isSSE ? splitIntoRounds(scrubbedBody) : [
     { name: "part_00_complete.json", content: scrubbedBody, type: "complete" }
   ];
 
-  // ── Step 4: Build capture manifest ──
+  // Manifest
   const manifest = {
     captured_at: capturedAt,
     conversation_id: fingerprint.conversation_id,
@@ -511,33 +465,24 @@ function saveCapture(tabId, requestId, info) {
     tabUrl: info.tabUrl,
     total_bytes: scrubbedBody.length,
     original_bytes: info.body.length,
+    has_stream: fingerprint.has_stream,
     split_method: parts.some(p => p.type === "chunk") ? "fixed_8mb" : "round_boundary",
     parts: parts.map(p => ({
-      name: p.name,
-      type: p.type,
-      bytes: p.content.length,
+      name: p.name, type: p.type, bytes: p.content.length,
     })),
   };
-  if (state.label) {
-    manifest.label = state.label;
-  }
+  if (state.label) manifest.label = state.label;
 
-  // ── Step 5: Write all files ──
+  // Write all files
 
-  // 5a. Capture manifest
-  downloadFile(
-    JSON.stringify(manifest, null, 2),
-    `${folderPath}/manifest.json`,
-    "application/json"
-  );
+  downloadFile(JSON.stringify(manifest, null, 2), `${folderPath}/manifest.json`, "application/json");
 
-  // 5b. Each part file
   for (const part of parts) {
     const mime = part.name.endsWith(".json") ? "application/json" : "text/plain";
     downloadFile(part.content, `${folderPath}/${part.name}`, mime);
   }
 
-  // 5c. Response headers (scrubbed)
+  // Meta (response headers, scrubbed)
   const meta = {
     url: info.url,
     method: info.method,
@@ -548,97 +493,227 @@ function saveCapture(tabId, requestId, info) {
     captureMethod: info.captureMethod,
     bodyBytes: scrubbedBody.length,
   };
-  if (state.label) {
-    meta.label = state.label;
+  if (state.label) meta.label = state.label;
+  downloadFile(JSON.stringify(meta, null, 2), `${folderPath}/meta.json`, "application/json");
+
+  // Request body (scrubbed) — for POST conversation requests
+  if (info.requestBody) {
+    const scrubbedRequest = scrubText(info.requestBody);
+    downloadFile(scrubbedRequest, `${folderPath}/request.json`, "application/json");
   }
-  downloadFile(
-    JSON.stringify(meta, null, 2),
-    `${folderPath}/meta.json`,
-    "application/json"
-  );
 
-  // 5d. Fingerprint sidecar
-  downloadFile(
-    JSON.stringify(fingerprint, null, 2),
-    `${folderPath}/fingerprint.json`,
-    "application/json"
-  );
+  // Fingerprint
+  downloadFile(JSON.stringify(fingerprint, null, 2), `${folderPath}/fingerprint.json`, "application/json");
 
-  // 5e. Append to running fingerprints.jsonl
-  downloadFile(
-    JSON.stringify(fingerprint) + "\n",
-    "sse-capture/fingerprints.jsonl",
-    "text/plain"
-  );
+  // Append to running fingerprints.jsonl
+  downloadFile(JSON.stringify(fingerprint) + "\n", "sse-capture/fingerprints.jsonl", "text/plain");
 
+  // Update state
   state.captures++;
   state.lastFile = folderName;
-  console.log("[sse-capture] saved capture #%d: %s (%d bytes, %d parts)",
-    state.captures, folderName, scrubbedBody.length, parts.length);
+  if (fingerprint.has_stream) {
+    state.streamCaptures++;
+    state.lastStreamTime = capturedAt;
+    // Track for missing-stream guard
+    if (fingerprint.conversation_id) {
+      state.recentStreamConvIds.push({
+        convId: fingerprint.conversation_id,
+        time: Date.now(),
+      });
+      // Keep only last 5 minutes
+      const cutoff = Date.now() - 5 * 60 * 1000;
+      state.recentStreamConvIds = state.recentStreamConvIds.filter(e => e.time > cutoff);
+    }
+    // Clear ERR badge on successful stream capture
+    setBadge(tabId, true);
+  }
+
+  console.log("[sse-capture] saved capture #%d: %s (%d bytes, %d parts, stream=%s, method=%s)",
+    state.captures, folderName, scrubbedBody.length, parts.length,
+    fingerprint.has_stream, info.method);
+
+  // Missing-stream guard: if this is a GET conversation/<id> with search results
+  // but no stream was captured for this conversation_id recently, warn
+  if (!fingerprint.has_stream && fingerprint.keys_present.search_result_groups) {
+    const convId = fingerprint.conversation_id;
+    if (convId) {
+      const hasRecentStream = state.recentStreamConvIds.some(e => e.convId === convId);
+      if (!hasRecentStream) {
+        saveError(tabId, {
+          warning: "conversation_with_search_but_no_stream",
+          conversation_id: convId,
+          url: info.url,
+          time: capturedAt,
+          detail: "GET conversation contains search_result_groups but no stream capture was saved for this conversation_id in the last 5 minutes. The answer stream may have been missed.",
+        });
+      }
+    }
+  }
+}
+
+// ── Base64 decoder for streamed chunks ───────────────────────────────────
+
+function decodeBase64Chunks(chunks) {
+  // Each chunk is a base64-encoded fragment. Concatenate and decode.
+  const combined = chunks.join("");
+  try {
+    return decodeURIComponent(escape(atob(combined)));
+  } catch (e) {
+    // If combined base64 has padding issues, try chunk-by-chunk
+    let result = "";
+    for (const chunk of chunks) {
+      try {
+        result += decodeURIComponent(escape(atob(chunk)));
+      } catch (_) {
+        // Raw text fallback
+        try { result += atob(chunk); } catch (__) { result += chunk; }
+      }
+    }
+    return result;
+  }
 }
 
 // ── Debugger event handler ────────────────────────────────────────────────
 
-/**
- * All chrome.debugger events arrive here. We handle three:
- *
- * 1. Network.responseReceived
- *    Fires when response headers arrive. We check if the URL matches our
- *    conversation pattern. If so, we register the request in pendingRequests
- *    and record the URL, method, and response headers.
- *
- * 2. Network.eventSourceMessageReceived
- *    Fires for each SSE event in a streaming response. We concatenate the
- *    raw event data. This is the primary capture path for ChatGPT streams.
- *
- * 3. Network.loadingFinished
- *    Fires when the response body is complete. For SSE streams, we may
- *    already have the body from eventSourceMessage events. If not, we call
- *    Network.getResponseBody to fetch the buffered body from DevTools.
- */
 chrome.debugger.onEvent.addListener(async (source, method, params) => {
   const tabId = source.tabId;
   const state = tabs.get(tabId);
   if (!state || !state.attached) return;
 
+  // ── Network.requestWillBeSent: capture method, URL, POST body ──
+  if (method === "Network.requestWillBeSent") {
+    const url = params.request?.url || "";
+    if (!CONV_PATTERN.test(url)) return;
+
+    const reqMethod = params.request?.method || "GET";
+    const requestId = params.requestId;
+
+    // Store request info; responseReceived will merge headers later
+    if (!state.pendingRequests[requestId]) {
+      state.pendingRequests[requestId] = {
+        url,
+        method: reqMethod,
+        headers: {},
+        startTime: new Date().toISOString(),
+        sseChunks: [],
+        dataChunks: [],
+        requestBody: null,
+        tabUrl: "",
+        isStream: false,
+        contentType: "",
+      };
+    } else {
+      // Merge: requestWillBeSent may fire before or after responseReceived
+      state.pendingRequests[requestId].url = url;
+      state.pendingRequests[requestId].method = reqMethod;
+    }
+
+    // Capture POST body for conversation endpoints
+    if (reqMethod === "POST" && params.request?.hasPostData) {
+      try {
+        const postData = params.request.postData;
+        if (postData) {
+          state.pendingRequests[requestId].requestBody = postData;
+        } else {
+          // postData not inline; fetch it
+          const result = await chrome.debugger.sendCommand(
+            { tabId }, "Network.getRequestPostData",
+            { requestId }
+          );
+          if (result?.postData) {
+            state.pendingRequests[requestId].requestBody = result.postData;
+          }
+        }
+      } catch (err) {
+        console.warn("[sse-capture] getRequestPostData failed for %s: %s", requestId, err.message);
+      }
+    }
+
+    // Get tab URL
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      state.pendingRequests[requestId].tabUrl = tab.url || "";
+    } catch (_) {}
+
+    console.log("[sse-capture] request %s %s: %s", reqMethod, requestId, url);
+  }
+
+  // ── Network.responseReceived: headers, content-type, register tracking ──
   if (method === "Network.responseReceived") {
     const url = params.response?.url || "";
     if (!CONV_PATTERN.test(url)) return;
 
-    // Register this request for body capture
-    state.pendingRequests[params.requestId] = {
-      url,
-      method: params.response?.requestHeaders?.[":method"] || "GET",
-      headers: params.response?.headers || {},
-      startTime: new Date().toISOString(),
-      sseChunks: [],
-      tabUrl: "",
-    };
+    const requestId = params.requestId;
 
-    // Get the tab URL for the sidecar
-    try {
-      const tab = await chrome.tabs.get(tabId);
-      state.pendingRequests[params.requestId].tabUrl = tab.url || "";
-    } catch (_) {}
+    // Create or merge with existing pending entry
+    if (!state.pendingRequests[requestId]) {
+      state.pendingRequests[requestId] = {
+        url,
+        method: params.response?.requestHeaders?.[":method"] || "GET",
+        headers: params.response?.headers || {},
+        startTime: new Date().toISOString(),
+        sseChunks: [],
+        dataChunks: [],
+        requestBody: null,
+        tabUrl: "",
+        isStream: false,
+        contentType: "",
+      };
+    }
 
-    console.log("[sse-capture] tracking request %s: %s", params.requestId, url);
+    const pending = state.pendingRequests[requestId];
+    pending.headers = params.response?.headers || pending.headers;
+    // Don't overwrite method from requestWillBeSent with the response header fallback
+    if (pending.method === "GET" && params.response?.requestHeaders?.[":method"]) {
+      pending.method = params.response.requestHeaders[":method"];
+    }
+
+    // Detect stream responses (text/event-stream)
+    const ct = (params.response?.headers?.["content-type"] || "").toLowerCase();
+    pending.contentType = ct;
+    if (ct.includes("text/event-stream")) {
+      pending.isStream = true;
+      console.log("[sse-capture] stream detected for %s: %s", requestId, url);
+    }
+
+    // Get tab URL if not already set
+    if (!pending.tabUrl) {
+      try {
+        const tab = await chrome.tabs.get(tabId);
+        pending.tabUrl = tab.url || "";
+      } catch (_) {}
+    }
+
+    console.log("[sse-capture] response %s: %s (ct=%s)", requestId, url, ct.slice(0, 40));
   }
 
-  if (method === "Network.eventSourceMessageReceived") {
-    // SSE event: concatenate raw event text.
-    // params: { requestId, timestamp, eventName, eventId, data }
+  // ── Network.dataReceived: accumulate streamed body chunks ──
+  if (method === "Network.dataReceived") {
     const pending = state.pendingRequests[params.requestId];
     if (!pending) return;
 
-    // Reconstruct the raw SSE frame: "event: ...\ndata: ...\n\n"
+    // For stream responses, we accumulate the raw data
+    // params has: requestId, timestamp, dataLength, encodedDataLength, data (base64 if available)
+    // Note: 'data' field may not always be present in Network.dataReceived.
+    // We need to use Fetch.dataReceived or the streaming approach.
+    // Actually in CDP, Network.dataReceived does NOT carry the data payload.
+    // The data is available via Network.getResponseBody at loadingFinished,
+    // OR via Fetch domain interception, OR via Network.streamResourceContent.
+    // We'll try getResponseBody at loadingFinished, and if that fails for
+    // streams, we record the failure.
+  }
+
+  // ── Network.eventSourceMessageReceived: secondary path (legacy) ──
+  if (method === "Network.eventSourceMessageReceived") {
+    const pending = state.pendingRequests[params.requestId];
+    if (!pending) return;
+
     let frame = "";
     if (params.eventName) frame += `event: ${params.eventName}\n`;
     if (params.eventId) frame += `id: ${params.eventId}\n`;
     frame += `data: ${params.data}\n\n`;
     pending.sseChunks.push(frame);
 
-    // Periodically flush to chrome.storage.session to survive worker suspension.
-    // We flush every 50 chunks to balance write frequency vs data loss risk.
     if (pending.sseChunks.length % 50 === 0) {
       try {
         await chrome.storage.session.set({
@@ -652,12 +727,12 @@ chrome.debugger.onEvent.addListener(async (source, method, params) => {
           }
         });
       } catch (e) {
-        // storage.session has a 10 MB quota; if exceeded, log but continue
         console.warn("[sse-capture] session storage flush failed:", e.message);
       }
     }
   }
 
+  // ── Network.loadingFinished: assemble body and save ──
   if (method === "Network.loadingFinished") {
     const pending = state.pendingRequests[params.requestId];
     if (!pending) return;
@@ -666,36 +741,62 @@ chrome.debugger.onEvent.addListener(async (source, method, params) => {
     let captureMethod = "";
 
     if (pending.sseChunks.length > 0) {
-      // We captured via eventSourceMessage events — use those
+      // Captured via eventSourceMessage events
       body = pending.sseChunks.join("");
       captureMethod = "eventSourceMessages";
     } else {
-      // No SSE events received — try getResponseBody for buffered responses.
-      // Network.getResponseBody returns { body, base64Encoded }.
+      // Try getResponseBody. For streamed fetch responses this may fail.
       try {
         const result = await chrome.debugger.sendCommand(
-          { tabId },
-          "Network.getResponseBody",
+          { tabId }, "Network.getResponseBody",
           { requestId: params.requestId }
         );
         if (result.base64Encoded) {
-          body = atob(result.body);
+          body = decodeURIComponent(escape(atob(result.body)));
         } else {
           body = result.body;
         }
         captureMethod = "getResponseBody";
       } catch (err) {
-        console.error(
-          "[sse-capture] getResponseBody failed for %s: %s",
-          params.requestId,
-          err.message
-        );
+        // If this was a stream response, the failure is expected and critical
+        if (pending.isStream) {
+          console.error(
+            "[sse-capture] STREAM CAPTURE FAILED for %s (%s): %s",
+            params.requestId, pending.url, err.message
+          );
+          saveError(tabId, {
+            error: "stream_capture_failed",
+            url: pending.url,
+            method: pending.method,
+            requestId: params.requestId,
+            contentType: pending.contentType,
+            time: new Date().toISOString(),
+            detail: "getResponseBody failed on streamed fetch response: " + err.message,
+            hint: "ChatGPT streams via fetch(). Chrome cannot buffer these for getResponseBody. " +
+                  "This extension version attempts getResponseBody as a fallback; if this error " +
+                  "persists, the stream must be captured via Irina's fetch-hook script.",
+          });
+          delete state.pendingRequests[params.requestId];
+          return;
+        }
+
+        // Non-stream getResponseBody failure: also record
+        console.error("[sse-capture] getResponseBody failed for %s: %s",
+          params.requestId, err.message);
+        saveError(tabId, {
+          error: "getResponseBody_failed",
+          url: pending.url,
+          method: pending.method,
+          requestId: params.requestId,
+          time: new Date().toISOString(),
+          detail: err.message,
+        });
         delete state.pendingRequests[params.requestId];
         return;
       }
     }
 
-    // Clean up session storage for this request
+    // Clean up session storage
     try {
       await chrome.storage.session.remove(`pending_${tabId}_${params.requestId}`);
     } catch (_) {}
@@ -709,6 +810,17 @@ chrome.debugger.onEvent.addListener(async (source, method, params) => {
         tabUrl: pending.tabUrl,
         body,
         captureMethod,
+        requestBody: pending.requestBody,
+      });
+    } else if (pending.isStream) {
+      // Empty stream body is a capture failure
+      saveError(tabId, {
+        error: "stream_empty_body",
+        url: pending.url,
+        method: pending.method,
+        requestId: params.requestId,
+        time: new Date().toISOString(),
+        detail: "Stream response body was empty after capture attempt.",
       });
     }
 
@@ -718,10 +830,6 @@ chrome.debugger.onEvent.addListener(async (source, method, params) => {
 
 // ── Debugger detach handler ───────────────────────────────────────────────
 
-/**
- * Fires when the debugger is detached externally (user closed DevTools,
- * tab navigated away, or the banner's "cancel" was clicked).
- */
 chrome.debugger.onDetach.addListener((source, reason) => {
   const state = tabs.get(source.tabId);
   if (state) {
@@ -736,7 +844,6 @@ chrome.debugger.onDetach.addListener((source, reason) => {
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   if (tabs.has(tabId)) {
-    // Debugger auto-detaches on tab close; just clean up state
     tabs.delete(tabId);
     console.log("[sse-capture] tab %d closed, state cleaned up", tabId);
   }
@@ -751,7 +858,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       sendResponse({
         attached: state.attached,
         captures: state.captures,
+        streamCaptures: state.streamCaptures,
         lastFile: state.lastFile,
+        lastStreamTime: state.lastStreamTime,
         label: state.label,
       });
     } else if (msg.type === "toggle") {
@@ -759,7 +868,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       sendResponse({
         attached: state.attached,
         captures: state.captures,
+        streamCaptures: state.streamCaptures,
         lastFile: state.lastFile,
+        lastStreamTime: state.lastStreamTime,
         label: state.label,
       });
     } else if (msg.type === "setLabel") {
@@ -768,5 +879,5 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       sendResponse({ ok: true });
     }
   })();
-  return true; // async sendResponse
+  return true;
 });

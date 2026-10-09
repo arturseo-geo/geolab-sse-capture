@@ -33,6 +33,33 @@ The debug-window observation that prompted this tool originated with Metehan Yes
 
 As of approximately 8 Sep 2026, the detailed debug fields (`should_fetch`, `page_contents`, `meta_tags`, `crawl_date`, score objects, rewritten/fan-out queries) appear to have been removed by OpenAI. The citation layer (retrieval pools via `search_result_groups`, cited sets via `content_references`, `safe_urls`) remains present in captures at the time of this release. Do not assume any particular field will persist across OpenAI updates.
 
+## Changelog
+
+### v1.2.0 (2026-10-09) — Stream capture fix
+
+**What broke:** Between Sep 8 and Oct 9 2026, Chrome stopped returning streamed fetch() response bodies via `Network.getResponseBody`. ChatGPT streams answers via `POST /backend-api/f/conversation` returning `text/event-stream` over a standard `fetch()` call (not the EventSource API). The extension's `eventSourceMessageReceived` handler never fired (wrong transport), and the `getResponseBody` fallback silently failed, dropping the answer stream entirely. All Oct 9 captures had 0 SSE events.
+
+**What changed:**
+- Request capture via `Network.requestWillBeSent`: correct HTTP method (was always "GET"), request URL, and POST body (scrubbed). Saved as `request.json` in capture folder.
+- Error reporting: capture failures write `error.json` and set badge to "ERR" instead of failing silently.
+- Missing-stream guard: if a GET conversation capture contains search results but no stream was captured for that conversation_id recently, a warning is written.
+- Fingerprint additions: `method`, `has_stream`, `turn_use_case` (all values), `thinking_effort`, `is_temporary_chat`, `model_slugs` (all distinct values).
+- Popup: shows stream capture count and last stream time separately.
+- Version bump: manifest.json now says 1.2.0 (was 1.0.0 while commit said v1.1.0).
+
+**Known limitation:** `Network.getResponseBody` still fails on streamed fetch responses in current Chrome. If this persists, the stream must be captured via the companion fetch-hook script (Irina's capture_snippet). The extension reliably captures all non-stream conversation requests, request bodies, and metadata. When `getResponseBody` does work (e.g., future Chrome versions or non-streamed responses), the stream is captured normally.
+
+### v1.1.0 (2026-09-09) — Write-time scrubbing, schema fingerprints
+
+- Token scrubbing at write time (JWTs, Bearer, cookies, emails, user IDs)
+- Schema fingerprints per capture
+- SSE stream splitting at search/tool round boundaries
+
+### v1.0.0 (2026-09-08) — Initial release
+
+- Chrome DevTools Protocol capture of conversation endpoints
+- Download to local disk via chrome.downloads
+
 ## Install the extension
 
 1. Open `chrome://extensions/`
@@ -77,12 +104,13 @@ python scripts/scrub.py organised/  # before sharing anything
 Each capture produces a folder in `Downloads/sse-capture/`:
 
 ```
-2026-09-08T14-52-07-278Z_6aa020fd/
-  manifest.json          # Part list, byte counts, split method
+2026-10-09T08-52-06-000Z_6ac8aaf2/
+  manifest.json          # Part list, byte counts, split method, has_stream
   part_00_preamble.txt   # System messages, user prompt
   part_01_search.txt     # Search/tool round (web.run)
   part_02_answer.txt     # Assistant answer continuation
   meta.json              # Response headers (scrubbed), timing
+  request.json           # POST body (scrubbed) — model, effort, prompt (v1.2.0)
   fingerprint.json       # Schema fingerprint (see below)
 ```
 
