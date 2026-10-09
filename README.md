@@ -40,14 +40,16 @@ As of approximately 8 Sep 2026, the detailed debug fields (`should_fetch`, `page
 **What broke:** Between Sep 8 and Oct 9 2026, Chrome stopped returning streamed fetch() response bodies via `Network.getResponseBody`. ChatGPT streams answers via `POST /backend-api/f/conversation` returning `text/event-stream` over a standard `fetch()` call (not the EventSource API). The extension's `eventSourceMessageReceived` handler never fired (wrong transport), and the `getResponseBody` fallback silently failed, dropping the answer stream entirely. All Oct 9 captures had 0 SSE events.
 
 **What changed:**
+- Stream capture via `Network.streamResourceContent` (experimental CDP, Chrome 126+). On `responseReceived` for `text/event-stream` responses, the extension calls `streamResourceContent` immediately. This populates `Network.dataReceived` events with the actual streamed bytes. At `loadingFinished`, bufferedData + live chunks are assembled as raw bytes and decoded to UTF-8 once (avoids multibyte split).
 - Request capture via `Network.requestWillBeSent`: correct HTTP method (was always "GET"), request URL, and POST body (scrubbed). Saved as `request.json` in capture folder.
-- Error reporting: capture failures write `error.json` and set badge to "ERR" instead of failing silently.
+- Error reporting: capture failures write `error.json` and set badge to "ERR" instead of failing silently. `Network.loadingFailed` saves partial/truncated stream data if available.
 - Missing-stream guard: if a GET conversation capture contains search results but no stream was captured for that conversation_id recently, a warning is written.
-- Fingerprint additions: `method`, `has_stream`, `turn_use_case` (all values), `thinking_effort`, `is_temporary_chat`, `model_slugs` (all distinct values).
+- Fingerprint additions: `method`, `has_stream`, `turn_use_case` (all values from `server_ste_metadata`), `thinking_effort`, `is_temporary_chat`, `model_slugs` (all distinct values).
 - Popup: shows stream capture count and last stream time separately.
-- Version bump: manifest.json now says 1.2.0 (was 1.0.0 while commit said v1.1.0).
+- Chrome version recorded in `manifest.json` and `meta.json` per capture.
+- Version bump: manifest.json 1.0.0 -> 1.2.0 (was 1.0.0 while commit said v1.1.0).
 
-**Known limitation:** `Network.getResponseBody` still fails on streamed fetch responses in current Chrome. If this persists, the stream must be captured via the companion fetch-hook script (Irina's capture_snippet). The extension reliably captures all non-stream conversation requests, request bodies, and metadata. When `getResponseBody` does work (e.g., future Chrome versions or non-streamed responses), the stream is captured normally.
+**Chrome version requirement:** `Network.streamResourceContent` is experimental. Tested on Chrome 133+. If the command errors on an older Chrome, the extension falls back to `getResponseBody` and records the error. Check `chrome://version` for your Chrome version.
 
 ### v1.1.0 (2026-09-09) — Write-time scrubbing, schema fingerprints
 
